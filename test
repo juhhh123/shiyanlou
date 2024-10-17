@@ -1,0 +1,50 @@
+from detect_iro0416_new_new_new_0618 import Jump_count
+from detect_iro0416_new_new_new_0618 import Lowstate
+from detect_iro0416_new_new_new_0618 import Jump_count_hand_left
+from detect_iro0416_new_new_new_0618 import Jump_count_hand_right
+
+jump_iro_shoulder1 = Jump_count()
+low_left = Lowstate()
+low_right = Lowstate()
+low_left_hand = Jump_count_hand_left()
+low_right_hand = Jump_count_hand_right()
+left_num_sub = 0
+j_left = 0
+j_right = 0
+num_sub = 0
+num_sub_exit = 0
+num_sub_distance = 0
+with open(r"C:\Users\IROAD\PycharmProjects\czj_1\gujia\logs\logs\neck_2_2024-05-10_18-45-38.txt", "r") as file1, open(r"C:\Users\IROAD\PycharmProjects\czj_1\gujia\logs\logs\left_wrist_2_2024-05-10_18-45-38.txt", "r") as file2, open(r"C:\Users\IROAD\PycharmProjects\czj_1\gujia\logs\logs\right_wrist_2_2024-05-10_18-45-38.txt", "r") as file3:
+        for i, (line1, line2, line3) in enumerate(zip(file1, file2, file3)):
+                # 将读取的数值转换为浮点数，并赋值给 shoulder_y_iro
+                right_wrist_y_iro =  float(line3.strip())
+                left_wrist_y_iro = float(line2.strip())
+                shoulder_y_iro = float(line1.strip())
+
+                min_distance =  9.0148285
+
+                left_left_iro, ready_left = low_left.wrist_iro(left_wrist_y_iro, min_distance)
+                left_right_iro, ready_right = low_right.wrist_iro(right_wrist_y_iro, min_distance)
+# -----------------------------------------------------------------------------------------------------------------------------------
+
+                count_iro, exit, ready_iro = jump_iro_shoulder1.jump_count(shoulder_y_iro, min_distance, left_left_iro,ready_left,left_right_iro, ready_right, num_sub)
+
+                exit_left_hand,exit_left_hand_2 = low_left_hand.jump_count(left_wrist_y_iro,exit,min_distance)
+                exit_right_hand,exit_right_hand_2= low_right_hand.jump_count(right_wrist_y_iro, exit,min_distance)
+                if exit_left_hand_2 == 1 or exit_right_hand_2 == 1:
+                    num_sub_distance = 1
+                else:
+                    num_sub_distance = 0
+
+                if exit_right_hand == 1 or  exit_right_hand == 1:
+                    num_sub_exit = 1
+                else:
+                    num_sub_exit = 0
+
+                if num_sub_distance == 1 or num_sub_exit == 1:
+                    num_sub = 1
+                else:
+                    num_sub = 0
+                with open("logs/count_iro.txt", 'a') as file:
+                    file.write(f'{count_iro}\n')
+                print(f'count_iro: {count_iro}')
