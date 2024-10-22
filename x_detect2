@@ -1,0 +1,697 @@
+import argparse
+import time
+from pathlib import Path
+import math
+import os
+import copy
+import cv2
+import torch
+import torch.backends.cudnn as cudnn
+from numpy import random
+
+
+#  这份代码能够进行倒减，但不能进行  初始帧优化、位置变换以后。重新变换
+
+# class Lowstate_0507:
+#     def __init__(self):
+#         self.jump_list = []
+#         self.high_low_list = []
+#         self.m_readiness = 0
+#         self.low_sate = 0  # 若为1则代表处于处于低处
+#         self.ready = 0
+#     def wrist_iro(self,wrist_y_iro,min_distance):
+#         ready_ = False
+#         if self.ready == 1:
+#             self.ready = 0
+#         if self.jump_list and wrist_y_iro == self.jump_list[-1]:
+#             pass
+#         else:
+#             self.jump_list.append(wrist_y_iro)
+#             if len(self.jump_list) >= 4:
+#                 self.jump_list.pop(0)
+#             if len(self.jump_list) == 3:
+#                 self.m_readiness = 1
+#             if self.m_readiness == 1:
+#                 y0 = self.jump_list[0]
+#                 y1 = self.jump_list[1]
+#                 y2 = self.jump_list[2]
+#                 # 一直向上
+#                 if y0 >= y1 >= y2 :
+#                     self.low_sate = 1
+#                 # 一直向下
+#                 if y0 <= y1 <= y2 :
+#                     self.low_sate = 0
+#                 # 达到最高点
+#                 if y1 < y0 and y1 < y2 :  # 达到最高点
+#                     self.high_low_list.append(y1)
+#                     self.low_sate = 1
+#                     ready_ = True
+#                 # 达到最低点
+#                 if y1 > y0 and y1 > y2:
+#                     self.high_low_list.append(y1)
+#                     self.low_sate = 0
+#                     ready_ = True
+#         if ready_:
+#             if len(self.high_low_list) >=3:
+#                 self.high_low_list.pop(0)
+#             if len(self.high_low_list) == 2:
+#                 if (self.high_low_list[0] - self.high_low_list[1]) >= (6 * min_distance) :
+#                     self.ready = 0.5
+#                 elif (self.high_low_list[1] - self.high_low_list[0]) >= (6* min_distance):
+#                     self.ready = 1
+#                 else:
+#                     self.ready = 0
+#         return self.low_sate,self.ready
+
+
+class Lowstate:
+    def __init__(self):
+        self.jump_list = []
+        self.high_low_list = []
+        self.m_readiness = 0
+        self.low_sate = 0  # 若为1则代表处于处于低处
+        self.ready = 0
+        self.begin = 0
+    def wrist_iro(self,wrist_y_iro,min_distance):
+        ready_ = False
+        if self.ready == 1:
+            self.ready = 0
+        if self.jump_list and wrist_y_iro == self.jump_list[-1]:
+            pass
+        else:
+            self.jump_list.append(wrist_y_iro)
+            if len(self.jump_list) >= 4:
+                self.jump_list.pop(0)
+            if len(self.jump_list) == 3:
+                self.m_readiness = 1
+            if self.m_readiness == 1:
+                y0 = self.jump_list[0]
+                y1 = self.jump_list[1]
+                y2 = self.jump_list[2]
+                # 一直向上
+                if y0 >= y1 >= y2 :
+                    self.low_sate = 1
+                # 一直向下
+                if y0 <= y1 <= y2 :
+                    self.low_sate = 0
+                # 达到最高点
+                if y1 < y0 and y1 < y2 and y1 < (self.begin - min_distance * 0.15):   # 达到最高点 #####
+                    self.high_low_list.append(y1)
+                    self.low_sate = 1
+                    self.begin = y1   #####
+                    ready_ = True
+
+                # 达到最低点
+                if y1 > y0 and y1 > y2 and y1 > (self.begin + min_distance * 0.15):  #####
+                    self.high_low_list.append(y1)
+                    self.low_sate = 0
+                    self.begin = y1  #####
+                    ready_ = True
+
+        if ready_:
+            if len(self.high_low_list) >=3:
+                self.high_low_list.pop(0)
+            if len(self.high_low_list) == 2:
+                if (self.high_low_list[0] - self.high_low_list[1]) >= (1.5 * min_distance) :  #####
+                    self.ready = 0.5
+                elif (self.high_low_list[1] - self.high_low_list[0]) >= (1.5 * min_distance): #####
+                    self.ready = 1
+                else:
+                    self.ready = 0
+
+        return self.low_sate,self.ready
+
+
+class Jump_count_hand_left:
+    def __init__(self):
+        self.jump_list = []
+        self.count_number = 0
+        self.up = 0
+        self.m_readiness = 0
+        self.begin = 0
+        self.min_distance = 0
+        self.count_number_list = []
+        self.count_no_list = []
+        self.num_list = []
+        self.average_value = 10
+        self.exit = 0
+        self.exit_triggered = 0
+        self.exit_sub = 1
+        self.ready = 0
+        self.start = 0
+        self.high_low_list = []
+        self.count_new = 0
+        self.begin_init = 0
+        self.exit_num = 0
+        self.exit_distance = 0
+
+    def jump_count(self, hand_y,exit,min_distance):  ########
+        if exit == 0:
+            self.exit_distance = 0
+            # 位置初始化
+            if self.jump_list and hand_y == self.jump_list[-1]:
+                pass
+            elif hand_y:
+                self.jump_list.append(hand_y)
+                if len(self.jump_list) >= 4:
+                    self.jump_list.pop(0)
+                if len(self.jump_list) == 3:
+                    self.m_readiness = 1
+                if self.m_readiness == 1:
+                    y0 = self.jump_list[0]
+                    y1 = self.jump_list[1]
+                    y2 = self.jump_list[2]
+                    # 一直向上
+                    if y0 >= y1 >= y2:
+                        if self.up == 0:
+                            self.up = 1
+                    # 一直向下
+                    if y0 <= y1 <= y2:
+                        if self.up == 1:
+                            self.up = 0
+                    if self.begin != 0:
+                        # 达到最高点
+                        if y1 < y0 and y1 < y2:  # 达到最高点
+                            if self.up == 1 and y1 < (self.begin - min_distance * 0.10):     ########
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.up = 0
+                                self.begin = y1
+                            else:
+                                self.up = 0
+
+                        # 达到最低点
+                        if y1 > y0 and y1 > y2:
+                            if self.up == 0 and y1 > (self.begin + min_distance * 0.10):   ########
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.up = 1
+                                self.begin = y1
+                            else:
+                                self.up = 1
+
+                    else:  # 刚开始起步阶段
+                        # 达到最低点
+                        if y1 > y0 and y1 > y2:  # 达到最高点
+                            # if self.start == 0.25:
+                            if self.up == 0:
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.begin = y1
+                                self.exit = 0
+
+                            self.up = 1
+                        # 达到最高点
+                        if y1 < y0 and y1 < y2:
+                            if self.up == 1 :
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.begin = y1
+                                self.exit = 0
+                            self.up = 0
+
+                    # 新加的内容
+                    # if len(self.high_low_list) >= 2 :
+                    #     high_low_0 = self.high_low_list[-2]
+                    #     high_low_1 = self.high_low_list[-1]
+                    #     differ = abs(high_low_1 - high_low_0)
+                    #     if (y2 - max(high_low_0,high_low_1)) > 2 * differ or (min(high_low_0,high_low_1) - y2) >  2 * differ :
+                    #         self.exit_distance = 1
+
+                    if len(self.high_low_list) >= 2:
+                        differences = [abs(self.high_low_list[i] - self.high_low_list[i - 1]) for i in
+                                       range(1, len(self.high_low_list))]
+                        if (y2 - max(self.high_low_list) )>  0.5* max(differences) or (min(self.high_low_list) - y2) > 0.5 *max(differences):
+                            self.exit_distance = 1
+
+
+            if self.begin != 0:
+                if self.count_number_list and self.count_number == self.count_number_list[-1]:  # 当个数没变化时，非第一帧
+                    t0 = time.time()
+                    self.count_no_list.append(t0)
+                    # print(len(self.count_no_list))
+                    if len(self.num_list) == 3 and len(self.count_no_list) > max((1.6 * self.max_value), 3):  # 修改为 ！=
+                        self.exit = 1
+                        self.begin = 0
+
+                        self.high_low_list = []
+
+                else:  # 当个数有变化时，或者是第一帧，进行判断
+                    # 将所有的个数存成一个list
+                    self.count_number_list.append(self.count_number)
+                    nums = len(self.count_no_list)
+                    if nums != 0:
+                        self.num_list.append(nums)
+                    if len(self.num_list) >= 4:
+                        self.num_list.pop(0)
+                    if len(self.num_list) == 3:
+                        self.max_value = max(self.num_list)
+                    self.count_no_list = []
+            else:
+                self.count_no_list = []
+                self.num_list = []
+
+                self.high_low_list = []
+            return  self.exit,self.exit_distance
+        else:
+            self.exit = 0
+            self.begin = 0
+            return 0,0
+
+
+
+
+class Jump_count_hand_right:
+    def __init__(self):
+        self.jump_list = []
+        self.count_number = 0
+        self.up = 0
+        self.m_readiness = 0
+        self.begin = 0
+        self.min_distance = 0
+        self.count_number_list = []
+        self.count_no_list = []
+        self.num_list = []
+        self.average_value = 10
+        self.exit = 0
+        self.exit_triggered = 0
+        self.exit_sub = 1
+        self.ready = 0
+        self.start = 0
+        self.high_low_list = []
+        self.count_new = 0
+        self.begin_init = 0
+        self.exit_num = 0
+        self.exit_distance = 0
+
+    def jump_count(self, hand_y,exit,min_distance ):
+        if exit == 0:
+            self.exit_distance = 0
+            # 位置初始化
+            if self.jump_list and hand_y == self.jump_list[-1]:
+                pass
+            elif hand_y:
+                self.jump_list.append(hand_y)
+                if len(self.jump_list) >= 4:
+                    self.jump_list.pop(0)
+                if len(self.jump_list) == 3:
+                    self.m_readiness = 1
+                if self.m_readiness == 1:
+                    y0 = self.jump_list[0]
+                    y1 = self.jump_list[1]
+                    y2 = self.jump_list[2]
+                    # 一直向上
+                    if y0 >= y1 >= y2:
+                        if self.up == 0:
+                            self.up = 1
+                    # 一直向下
+                    if y0 <= y1 <= y2:
+                        if self.up == 1:
+                            self.up = 0
+                    if self.begin != 0:
+                        # 达到最高点
+                        if y1 < y0 and y1 < y2:  # 达到最高点
+                            if self.up == 1 and y1 < (self.begin - min_distance * 0.1):
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.up = 0
+                                self.begin = y1
+                            else:
+                                self.up = 0
+
+                        # 达到最低点
+                        if y1 > y0 and y1 > y2:
+                            if self.up == 0 and y1 > (self.begin + min_distance * 0.1):
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.up = 1
+                                self.begin = y1
+                            else:
+                                self.up = 1
+
+                    else:  # 刚开始起步阶段
+                        # 达到最低点
+                        if y1 > y0 and y1 > y2:  # 达到最高点
+                            # if self.start == 0.25:
+                            if self.up == 0:
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.begin = y1
+                                self.exit = 0
+
+                            self.up = 1
+                        # 达到最高点
+                        if y1 < y0 and y1 < y2:
+                            if self.up == 1 :
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.begin = y1
+                                self.exit = 0
+                            self.up = 0
+                    ######## 新加的内容--------------------------------------------
+                    # if len(self.high_low_list) >= 2 :
+                    #     high_low_0 = self.high_low_list[-2]
+                    #     high_low_1 = self.high_low_list[-1]
+                    #     differ = abs(high_low_1 - high_low_0)
+                    #     if (y2 - max(high_low_0,high_low_1)) > 2 * differ or (min(high_low_0,high_low_1) - y2) >  2 * differ :
+                    #         self.exit_distance = 1
+
+                    if len(self.high_low_list) >= 2:
+                        differences = [abs(self.high_low_list[i] - self.high_low_list[i - 1]) for i in
+                                       range(1, len(self.high_low_list))]
+                        if (y2 - max(self.high_low_list) )> 0.5 * max(differences) or (min(self.high_low_list) - y2) > 0.5 *max(differences):
+                            self.exit_distance = 1
+
+
+
+            if self.begin != 0:
+                if self.count_number_list and self.count_number == self.count_number_list[-1]:  # 当个数没变化时，非第一帧
+                    t0 = time.time()
+                    self.count_no_list.append(t0)
+                    # print(len(self.count_no_list))
+                    if len(self.num_list) == 3 and len(self.count_no_list) > max((1.6 * self.max_value), 4):  # 修改为 ！=
+                        self.exit = 1
+                        self.begin = 0
+
+                else:  # 当个数有变化时，或者是第一帧，进行判断
+                    # 将所有的个数存成一个list
+                    self.count_number_list.append(self.count_number)
+                    nums = len(self.count_no_list)
+                    if nums != 0:
+                        self.num_list.append(nums)
+                    if len(self.num_list) >= 4:
+                        self.num_list.pop(0)
+                    if len(self.num_list) == 3:
+                        self.max_value = max(self.num_list)
+                    self.count_no_list = []
+            else:
+                self.count_no_list = []
+                self.num_list = []
+            return  self.exit,self.exit_distance
+        else:
+            self.exit = 0
+            self.begin = 0
+            return 0,0
+
+
+
+class Jump_count:
+    def __init__(self):
+        self.jump_list = []
+        self.count_number = 0
+        self.up = 0
+        self.m_readiness = 0
+        self.begin = 0
+        self.min_distance = 0
+        self.count_number_list = []
+        self.count_no_list = []
+        self.num_list = []
+        self.exit = 1
+        self.ready = 0
+        self.start = 0
+        self.high_low_list =[]
+        self.begin_init = 0
+        self.count_record = []
+        self.min_angle = 95  # 最小角度
+        self.max_angle = 180  # 最大角度
+
+        # self.left_wrist_y_history = []  # 存储左手腕Y坐标的历史记录
+        # self.right_wrist_y_history = []  # 存储右手腕Y坐标的历史记录
+        # self.shoulder_y_history = []  # 存储肩部Y坐标的历史记录
+        # self.cycle_detection_done = False  # 添加一个标志来表示周期性检测是否已完成
+    #     self.ankle_y_history = []  # 存储脚踝点的历史数据
+    #     self.min_ankle_distance = 3.5  # 脚踝点离地的最小距离
+    #
+    # def is_ankle_off_ground(self, ankle_y):
+    #     # 将当前脚踝点数据添加到历史记录中
+    #     self.ankle_y_history.append(ankle_y)
+    #
+    #     # 如果历史记录中的数据点少于2个，无法判断离地状态
+    #     if len(self.ankle_y_history) < 2:
+    #         return False
+    #
+    #     # 获取历史记录中的最大值和最小值
+    #     max_ankle_y, min_ankle_y = max(self.ankle_y_history), min(self.ankle_y_history)
+    #
+    #     # 检查最大值和最小值之间的距离是否超过最小离地距离
+    #     if (max_ankle_y - min_ankle_y) > self.min_ankle_distance:
+    #         # 重置历史记录，准备下一次检测
+    #         self.ankle_y_history = []
+    #         return True
+    #     else:
+    #         # 如果没有超过最小离地距离，清除历史记录，重新开始检测
+    #         if len(self.ankle_y_history) > 10:  # 假设超过10个数据点后，如果还没有检测到离地，则重置
+    #             self.ankle_y_history = []
+    #         return False
+
+    staticmethod
+
+    def calculate_angle(self,shoulder, elbow, wrist):
+        # 计算向量
+        v1 = (shoulder[0] - elbow[0], shoulder[1] - elbow[1])
+        v2 = (wrist[0] - elbow[0], wrist[1] - elbow[1])
+
+        # 计算点积
+        dot_product = v1[0] * v2[0] + v1[1] * v2[1]
+
+        # 计算模长
+        magnitude_v1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2)
+        magnitude_v2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2)
+
+        # 计算角度
+        angle = math.acos(dot_product / (magnitude_v1 * magnitude_v2))
+        return math.degrees(angle)
+
+    # def detect_cycle(self, left_wrist_y_history, right_wrist_y_history, shoulder_y_history):
+    #     # 使用四个变量来接收返回值
+    #     left_peaks, left_valleys, left_stable_peaks, left_stable_valleys = self.find_peaks_and_valleys(
+    #         left_wrist_y_history)
+    #     right_peaks, right_valleys, right_stable_peaks, right_stable_valleys = self.find_peaks_and_valleys(
+    #         right_wrist_y_history)
+    #     shoulder_peaks, shoulder_valleys, shoulder_stable_peaks, shoulder_stable_valleys = self.find_peaks_and_valleys(
+    #         shoulder_y_history)
+    #
+    #     # 检查是否存在足够的周期性变化，并且波峰和波谷的差值已经稳定
+    #     if self.has_sufficient_changes(left_stable_peaks, left_stable_valleys) and \
+    #             self.has_sufficient_changes(right_stable_peaks, right_stable_valleys) and \
+    #             self.has_sufficient_changes(shoulder_stable_peaks, shoulder_stable_valleys):
+    #         return True
+    #
+    #     return False
+    #
+    # def find_peaks_and_valleys(self, y_history, stable_threshold=0.1, min_stable_count=3):
+    #     peaks = []
+    #     valleys = []
+    #     stable_peaks = []
+    #     stable_valleys = []
+    #     if len(y_history) < 3:
+    #         return peaks, valleys, stable_peaks, stable_valleys
+    #
+    #     for i in range(1, len(y_history) - 1):
+    #         if y_history[i] > y_history[i - 1] and y_history[i] > y_history[i + 1]:
+    #             peaks.append(y_history[i])
+    #         elif y_history[i] < y_history[i - 1] and y_history[i] < y_history[i + 1]:
+    #             valleys.append(y_history[i])
+    #
+    #     # 检查波峰和波谷的差值是否稳定
+    #     peak_diffs = [valleys[i] - peaks[i] for i in range(len(valleys)) if i < len(peaks)]
+    #     if len(peak_diffs) > min_stable_count:
+    #         diffs = peak_diffs[-min_stable_count:]
+    #         if max(diffs) - min(diffs) <= stable_threshold:
+    #             stable_peaks = peaks[-min_stable_count:]
+    #             stable_valleys = valleys[-min_stable_count:]
+    #
+    #     return peaks, valleys, stable_peaks, stable_valleys
+    #
+    # def has_sufficient_changes(self, stable_peaks, stable_valleys):
+    #     if not stable_peaks or not stable_valleys:
+    #         return False
+    #
+    #     peak_to_valley_diffs = [stable_valleys[i] - stable_peaks[i] for i in range(len(stable_valleys))]
+    #     avg_diff = sum(peak_to_valley_diffs) / len(peak_to_valley_diffs)
+    #     threshold = avg_diff * 0.08 if avg_diff else 1
+    #
+    #     return threshold > self.min_distance * 0.08
+
+    def jump_count(self,shoulder_y,ankle_y,min_distance,left_left_iro,ready_left,right_left_iro,ready_right,num_sub,shoulder_x,shoulder_y1,elbow_x,elbow_y,wrist_x,wrist_y,left_wrist_y,right_wrist_y):
+        # if not self.is_ankle_off_ground(ankle_y):
+        #     return self.count_number, self.exit, self.ready
+        #位置初始化
+        elbow_angle = self.calculate_angle((shoulder_x, shoulder_y1), (elbow_x, elbow_y), (wrist_x, wrist_y))
+        print(f"Elbow angle: {elbow_angle} degrees")  # 打印肘部角度
+        if self.begin == 0 and shoulder_y:
+            self.begin = shoulder_y
+            self.begin_init = shoulder_y
+            self.min_distance = min_distance
+
+            # 正常触发条件
+
+        if ready_left != 0 and ready_right != 0 and left_left_iro == 0 and right_left_iro == 0 and self.min_angle <= elbow_angle <= self.max_angle:
+            self.ready = 1
+            print(f"正常触发条件满足，跳绳计数启动")
+        # if not self.ready:
+        #     # 更新历史记录
+        #     if not self.cycle_detection_done:
+        #         self.left_wrist_y_history.append(left_wrist_y)
+        #         self.right_wrist_y_history.append(right_wrist_y)
+        #         self.shoulder_y_history.append(shoulder_y)
+        #
+        #         if self.detect_cycle(self.left_wrist_y_history, self.right_wrist_y_history, self.shoulder_y_history):
+        #             self.ready = 1
+        #             # 从第四个周期开始计数
+        #             if len(self.left_wrist_y_history) >= 2:
+        #                 self.count_number = sum(1 for i in range(3, len(self.left_wrist_y_history) - 1)
+        #                                         if self.left_wrist_y_history[i] - self.left_wrist_y_history[
+        #                                             i + 1] > self.min_distance * 0.5)
+        #             print("周期性运动检测到，跳绳计数启动")
+        #             self.cycle_detection_done = True  # 设置周期性检测完成标志
+
+
+        if self.jump_list and shoulder_y == self.jump_list[-1]:
+            pass
+        elif shoulder_y:
+            self.jump_list.append(shoulder_y)
+            if len(self.jump_list) >= 4:
+                self.jump_list.pop(0)
+            if len(self.jump_list) == 3:
+                self.m_readiness = 1
+            if self.m_readiness == 1:
+                y0 = self.jump_list[0]
+                y1 = self.jump_list[1]
+                y2 = self.jump_list[2]
+                # 一直向上
+                if y0 >= y1 >= y2 :
+                    if self.up == 0:
+                        self.up = 1
+                # 一直向下
+                if y0 <= y1 <= y2 :
+                    if self.up == 1:
+                        self.up = 0
+                if self.exit == 0:
+                    # 达到最高点
+                    if y1 < y0 and y1 < y2: # 达到最高点
+                        if self.up == 1 and y1 < (self.begin - self.min_distance * 0.15 ):   #####
+                            self.count_number +=0.5
+                            self.high_low_list.append(y1)
+                            self.up = 0
+                            self.begin = y1
+                        else:
+                            self.up = 0
+
+                    # 达到最低点
+                    if y1 > y0 and y1 > y2  :
+                        if self.up == 0 and y1 > (self.begin + self.min_distance * 0.15 ):   #####
+                            self.count_number += 0.5
+                            self.high_low_list.append(y1)
+                            self.up = 1
+                            self.begin = y1
+                        else:
+                            self.up = 1
+
+
+                else:  #刚开始起步阶段
+                    # 达到最高点
+                    if y1 < y0 and y1 < y2:  # 达到最高点
+                        if self.start == 0.25 :
+                        # if self.start == 0.25 or self.start == 0.75 :
+                            if self.up == 1  and y1 < (self.begin - self.min_distance * 0.5) :
+                                self.count_number += 0.5
+                                self.high_low_list.append(y1)
+                                self.begin = y1
+                                self.start += 0.25
+                                if self.start == 0.5:
+                                    self.exit = 0
+                                    self.start = 0
+                            else:
+                                self.start = 0
+                                # self.begin = self.begin_init
+                                self.count_number -= 0.5
+                                self.high_low_list = []
+                        self.up = 0
+                    # 达到最低点
+                    if y1 > y0 and y1 > y2:
+                        if self.up == 0 and self.ready == 1  and self.start == 0:    #####
+                            self.count_number += 0.5
+                            self.high_low_list.append(y1)
+                            self.begin = y1
+                            self.start += 0.25
+
+                        self.up = 1
+
+        # self.count_record.append(self.count_number)
+
+        if self.exit == 0 or self.start != 0:
+            if self.count_number_list and self.count_number == self.count_number_list[-1]:  # 当个数没变化时，非第一帧
+                t0 = time.time()
+                self.count_no_list.append(t0)
+                print(len(self.count_no_list))
+                if len(self.num_list) == 3 and len(self.count_no_list) > 1.6 * self.max_value or num_sub != 0:  # 修改为 ！=
+                    # if len(self.num_list) == 3 and len(self.count_no_list) > max((1.6 * self.max_value),5): #修改为 ！=
+                    self.exit = 1
+                    self.start = 0
+
+                    # self.begin = self.begin_init  ##修改0516
+
+                    # 要对个数self.count_number 以及 self.count_number_list 进行修改
+                    # self.count_number = self.count_record[-1*(num_sub)-1]
+                    # self.count_number_list.append(self.count_number)
+                    self.ready = 0
+
+                    # 进行倒减操作
+                    differences = [abs(self.high_low_list[i] - self.high_low_list[i - 1]) for i in
+                                   range(1, len(self.high_low_list))]
+                    # 逆向遍历差值列表
+                    for i in range(len(differences) - 1, -1, -1):
+                        if differences[i] < self.min_distance * 0.5:
+                            # 删除该数及其后面的所有元素
+                            del differences[i:]
+                            self.count_number_list.pop(-1)
+                        else:
+                            break
+                    self.count_number_list.pop(-1)
+
+                    self.count_number = self.count_number_list[-1]
+
+            elif num_sub != 0:    #####
+                self.exit = 1     #####
+                self.start = 0    #####
+                self.ready = 0
+
+                # 进行倒减操作
+                differences = [abs(self.high_low_list[i] - self.high_low_list[i - 1]) for i in
+                               range(1, len(self.high_low_list))]
+                # 逆向遍历差值列表
+                for i in range(len(differences) - 1, -1, -1):
+                    if differences[i] < self.min_distance * 0.5:
+                        # 删除该数及其后面的所有元素
+                        del differences[i:]
+                        self.count_number_list.pop(-1)
+                    else:
+                        break
+                self.count_number_list.pop(-1)
+
+                self.count_number = self.count_number_list[-1]
+
+
+
+
+
+
+
+            else:  # 当个数有变化时，或者是第一帧，进行判断
+                # 将所有的个数存成一个list
+                self.count_number_list.append(self.count_number)
+                nums = len(self.count_no_list)
+                if nums != 0:
+                    self.num_list.append(nums)
+                if len(self.num_list) >= 4:
+                    self.num_list.pop(0)
+                if len(self.num_list) == 3:
+                    self.max_value = max(self.num_list)
+                self.count_no_list = []
+        else:
+            # self.count_number_list = []
+            self.count_no_list = []
+            self.num_list = []
+
+        return self.count_number,self.exit,self.ready
