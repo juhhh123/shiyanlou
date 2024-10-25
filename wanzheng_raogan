@@ -1,0 +1,351 @@
+import os
+
+import onnxruntime
+import numpy as np
+import cv2
+import time
+# 调色板
+palette = np.array([[255, 128, 0], [255, 153, 51], [255, 178, 102],
+                    [230, 230, 0], [255, 153, 255], [153, 204, 255],
+                    [255, 102, 255], [255, 51, 255], [102, 178, 255],
+                    [51, 153, 255], [255, 153, 153], [255, 102, 102],
+                    [255, 51, 51], [153, 255, 153], [102, 255, 102],
+                    [51, 255, 51], [0, 255, 0], [0, 0, 255], [255, 0, 0],
+                    [255, 255, 255]])
+# 17个关键点连接顺序
+skeleton = [[16, 14], [14, 12], [17, 15], [15, 13], [12, 13], [6, 12],
+            [7, 13], [6, 7], [6, 8], [7, 9], [8, 10], [9, 11], [2, 3],
+            [1, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7]]
+# 骨架颜色
+pose_limb_color = palette[[9, 9, 9, 9, 7, 7, 7, 0, 0, 0, 0, 0, 16, 16, 16, 16, 16, 16, 16]]
+# 关键点颜色
+pose_kpt_color = palette[[16, 16, 16, 16, 16, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9]]
+
+def letterbox(im, new_shape=(640, 640), color=(114, 114, 114), scaleup=True):
+    '''  调整图像大小和两边灰条填充  '''
+    shape = im.shape[:2]  # 原图的大小
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+    # 缩放比例 (new / old)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    # 只进行下采样 因为上采样会让图片模糊
+    if not scaleup:
+        r = min(r, 1.0)
+    # 计算pad长宽
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))  # 保证缩放后图像比例不变
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+    # 在较小边的两侧进行pad, 而不是在一侧pad
+    dw /= 2
+    dh /= 2
+    # 将原图resize到new_unpad（长边相同，比例相同的新图）
+    if shape[::-1] != new_unpad:  # resize
+        im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)  #new_unpad是wh,线性插值法
+    # 计算上下两侧的padding
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    # 计算左右两侧的padding
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    # 添加灰条
+    im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return im
+
+def pre_process(img):
+    # 归一化 调整通道为（1，3，640，640）
+    img = img / 255.
+    img = np.transpose(img, (2, 0, 1))
+    data = np.expand_dims(img, axis=0)
+    return data
+
+def xywh2xyxy(x):
+    ''' 中心坐标、w、h ------>>> 左上点，右下点 '''
+    y = np.copy(x)
+    y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
+    y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
+    y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
+    y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
+    return y
+
+# nms算法
+def nms(dets, iou_thresh):
+    # dets: N * M, N是bbox的个数，M的前4位是对应的 左上点，右下点
+    x1 = dets[:, 0]
+    y1 = dets[:, 1]
+    x2 = dets[:, 2]
+    y2 = dets[:, 3]
+    scores = dets[:, 4]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)  # 求每个bbox的面积
+    order = scores.argsort()[::-1]  # 对分数进行倒排序
+    keep = []  # 用来保存最后留下来的bboxx下标
+    if order.size == 0:
+        return np.zeros((0, 5))  # 返回空的二维数组
+    while order.size > 0:
+        i = order[0]  # 无条件保留每次迭代中置信度最高的bbox
+        keep.append(i)
+        # 计算置信度最高的bbox和其他剩下bbox之间的交叉区域
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        # 计算置信度高的bbox和其他剩下bbox之间交叉区域的面积
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        # 求交叉区域的面积占两者（置信度高的bbox和其他bbox）面积和的必烈
+        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+        # 保留ovr小于thresh的bbox，进入下一次迭代。
+        inds = np.where(ovr <= iou_thresh)[0]
+        # 因为ovr中的索引不包括order[0]所以要向后移动一位
+        order = order[inds + 1]
+    output = []
+    for i in keep:
+        output.append(dets[i].tolist())
+    return np.array(output)
+
+def xyxy2xywh(a):
+    if a.size == 0:
+        return np.zeros((0, 4))  # 如果a为空，返回空的二维数组
+    ''' 左上点 右下点 ------>>> 左上点 宽 高 '''
+    b = np.copy(a)
+    # y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x center
+    # y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y center
+    b[:, 2] = a[:, 2] - a[:, 0]  # w
+    b[:, 3] = a[:, 3] - a[:, 1]  # h
+    return b
+
+def scale_boxes(img1_shape, boxes, img0_shape):
+    '''   将预测的坐标信息转换回原图尺度
+    :param img1_shape: 缩放后的图像尺度
+    :param boxes:  预测的box信息
+    :param img0_shape: 原始图像尺度
+    '''
+    # 将检测框(x y w h)从img1_shape(预测图) 缩放到 img0_shape(原图)
+    gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+    pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    boxes[:, 0] -= pad[0]
+    boxes[:, 1] -= pad[1]
+    boxes[:, :4] /= gain  # 检测框坐标点还原到原图上
+    num_kpts = boxes.shape[1] // 3   # 56 // 3 = 18
+    for kid in range(2,num_kpts+1):
+        boxes[:, kid * 3-1] = (boxes[:, kid * 3-1] - pad[0]) / gain
+        boxes[:, kid * 3 ]  = (boxes[:, kid * 3 ] -  pad[1]) / gain
+    # boxes[:, 5:] /= gain  # 关键点坐标还原到原图上
+    clip_boxes(boxes, img0_shape)
+    return boxes
+def clip_boxes(boxes, shape):
+    # 进行一个边界截断，以免溢出
+    # 并且将检测框的坐标（左上角x，左上角y，宽度，高度）--->>>（左上角x，左上角y，右下角x，右下角y）
+    top_left_x = boxes[:, 0].clip(0, shape[1])
+    top_left_y = boxes[:, 1].clip(0, shape[0])
+    bottom_right_x = (boxes[:, 0] + boxes[:, 2]).clip(0, shape[1])
+    bottom_right_y = (boxes[:, 1] + boxes[:, 3]).clip(0, shape[0])
+    boxes[:, 0] = top_left_x      #左上
+    boxes[:, 1] = top_left_y
+    boxes[:, 2] = bottom_right_x  #右下
+    boxes[:, 3] = bottom_right_y
+
+def plot_skeleton_kpts(im, kpts, steps=3):
+    num_kpts = len(kpts) // steps  # 51 / 3 =17
+    # 画点
+    for kid in range(num_kpts):
+        r, g, b = pose_kpt_color[kid]
+        x_coord, y_coord = kpts[steps * kid], kpts[steps * kid + 1]
+        conf = kpts[steps * kid + 2]
+        if conf > 0.5:   # 关键点的置信度必须大于 0.5
+            cv2.circle(im, (int(x_coord), int(y_coord)), 10, (int(r), int(g), int(b)), -1)
+    # 画骨架
+    for sk_id, sk in enumerate(skeleton):
+        r, g, b = pose_limb_color[sk_id]
+        pos1 = (int(kpts[(sk[0]-1)*steps]), int(kpts[(sk[0]-1)*steps+1]))
+        pos2 = (int(kpts[(sk[1]-1)*steps]), int(kpts[(sk[1]-1)*steps+1]))
+        conf1 = kpts[(sk[0]-1)*steps+2]
+        conf2 = kpts[(sk[1]-1)*steps+2]
+        if conf1 >0.5 and conf2 >0.5:  # 对于肢体，相连的两个关键点置信度 必须同时大于 0.5
+            cv2.line(im, pos1, pos2, (int(r), int(g), int(b)), thickness=2)
+
+class Keypoint():
+    def __init__(self, modelpath, pole_x, pole_y):
+        self.session = onnxruntime.InferenceSession(modelpath, providers=['CPUExecutionProvider'])
+        self.input_name = self.session.get_inputs()[0].name
+        self.label_name = self.session.get_outputs()[0].name
+        self.pole_x = pole_x
+        self.pole_y = pole_y
+        self.last_x = None
+        self.has_crossed_line = False  # 标志位，表示是否已经过线
+        self.success_crossing = False  # 标志位，表示是否已将完成绕杆全部流程
+        self.first_cross_line_x = None  # 存储第一次过线的x值
+        self.second_cross_line_x = None  # 存储第二次回线的x值
+    def check_pole_pass(self, kpts):
+        points = [kpts[15 * 3], kpts[16 * 3], kpts[13 * 3], kpts[14 * 3]]
+        if self.last_x is not None:
+            for x_coord in points:
+                if (x_coord < self.pole_x and self.last_x > self.pole_x) or (
+                        x_coord > self.pole_x and self.last_x < self.pole_x):
+                    return True
+        self.last_x = sum(points) / len(points)  # 更新 last_x 为四个点的平均值
+        return False
+
+    def check_cross_line(self, kpts, line_y):
+        points = [kpts[15 * 3], kpts[16 * 3]]  # 使用与过线相关的两个关键点的x坐标
+        points_y = [kpts[15 * 3 + 1], kpts[16 * 3 + 1]]  # 第15和第16个关键点的y坐标
+        if any(y_coord < line_y for y_coord in points_y):
+            if self.first_cross_line_x is None:  # 如果是第一次过线，则记录x值
+                self.first_cross_line_x = sum(points) / len(points)  # 记录第一次过线的x坐标平均值
+            self.has_crossed_line = True  # 更新标志位
+            return True
+        return False
+
+    def check_return_cross_line(self, kpts, line_y):
+        if self.has_crossed_line:  # 只有在已经过线的情况下才判断返回过线
+            points = [kpts[15 * 3], kpts[16 * 3]]  # 使用与过线相关的两个关键点的x坐标
+            points_y = [kpts[15 * 3 + 1], kpts[16 * 3 + 1]]  # 第15和第16个关键点的y坐标
+            if any(y_coord > line_y for y_coord in points_y) and self.first_cross_line_x is not None:
+                self.second_cross_line_x = sum(points) / len(points)  # 记录第二次回线的x坐标平均值
+                return True
+        return False
+
+    def complete_pole_crossing(self, kpts, line_y, pole_x):
+        # 首先检查是否过线
+        if not self.check_cross_line(kpts, line_y):
+            return False  # 如果没有过线，则直接结束
+
+        # 过线后，检查是否绕杆
+        if not self.check_pole_pass(kpts):
+            return False  # 如果没有绕杆，则直接结束
+
+        # 绕杆后，检查是否成功返回过线
+        if not self.check_return_cross_line(kpts, line_y):
+            return False  # 如果返回过线不成功，则直接结束
+
+        # 检查第二次过线是否与第一次过线的位置对称
+        if self.first_cross_line_x is not None and self.second_cross_line_x is not None:
+            if self.is_symmetric(self.first_cross_line_x, self.second_cross_line_x, pole_x):
+                self.success_crossing = True  # 设置成功标志
+                return True  # 如果第二次过线与第一次过线对称，则结束
+        return False  # 如果不对称，则结束
+
+    def is_symmetric(self, first_x, second_x, pole_x):
+        # 检查两个x坐标是否关于杆的y坐标对称
+        return (first_x > pole_x) != (second_x > pole_x)
+
+
+
+    def inference(self,image):
+        img = letterbox(image)    #调整图片的大小
+        data = pre_process(img) #归一化并且增加batch维度
+        # 预测输出float32[1, 56, 8400]
+        pred = self.session.run([self.label_name], {self.input_name: data.astype(np.float32)})[0]  #推理阶段
+        # [56, 8400]
+        pred = pred[0]
+        # [8400,56]
+        pred = np.transpose(pred, (1, 0))
+        # 置信度阈值过滤
+        conf = 0.3
+        pred = pred[pred[:, 4] > conf]   #第一次过滤，在这个例子中，由[8400,56]变成了[10,56]
+        # 中心宽高转左上点，右下点
+        bboxs = xywh2xyxy(pred)
+        # NMS处理
+        bboxs = nms(bboxs, iou_thresh=0.6)
+        # 坐标从左上点，右下点 到 左上点，宽，高.
+        if len(bboxs) == 0:
+            return image  # 如果没有边界框，直接返回原图
+        bboxs = np.array(bboxs)
+        if bboxs.ndim == 1:
+            bboxs = bboxs[np.newaxis, :]  # 确保bboxs是二维的
+        bboxs = xyxy2xywh(bboxs)
+        # 坐标点还原到原图
+        bboxs = scale_boxes(img.shape, bboxs, image.shape)
+        # 画框 画点 画骨架
+        for box in bboxs:
+            det_bbox, det_scores, kpts = box[0:4], box[4], box[5:]
+            if self.complete_pole_crossing(kpts, self.pole_y, self.pole_x):
+                print("Completed the pole crossing")
+            # 画框
+            cv2.rectangle(image, (int(det_bbox[0]), int(det_bbox[1])), (int(det_bbox[2]), int(det_bbox[3])),
+                                (0, 0, 255), 2)
+            # 人体检测置信度
+            if int(det_bbox[1]) < 30 :
+                cv2.putText(image, "conf:{:.2f}".format(det_scores), (int(det_bbox[0]) + 5, int(det_bbox[1]) +25),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 1)
+            else:
+                cv2.putText(image, "conf:{:.2f}".format(det_scores), (int(det_bbox[0]) + 5, int(det_bbox[1]) - 5),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 0, 255), 1)
+            # 画点 连线
+            plot_skeleton_kpts(image, kpts)
+
+
+
+        return image
+
+
+if __name__ == '__main__':
+    modelpath = r'C:\Users\IROAD\PycharmProjects\czj_1\gujia\logs\v8-C2f-sim.onnx'
+    pole_x = 645
+    pole_y = 342
+    # pole_x = 646
+    # pole_y = 343
+    keydet = Keypoint(modelpath, pole_x, pole_y)
+    #keydet = Keypoint(modelpath)
+    # 两种模式 1为图片预测，并显示结果图片；2为摄像头检测，并实时显示FPS
+    mode = 1
+    if mode == 1:
+        # 输入图片所在文件夹路径
+        input_image_folder_path = r'D:\zwtqq\wgxwrg'
+        # 输出图片文件夹路径
+        output_image_folder_path = r'D:\zwtqq\wgxwrg_tuili'
+        # 确保输出文件夹存在
+        if not os.path.exists(output_image_folder_path):
+            os.makedirs(output_image_folder_path)
+
+        # 遍历文件夹中的所有图片
+        for filename in os.listdir(input_image_folder_path):
+            if filename.endswith(".jpg") or filename.endswith(".png"):  # 根据需要可以添加更多图片格式
+                image_path = os.path.join(input_image_folder_path, filename)
+                image = cv2.imread(image_path)
+                start = time.time()
+                image = keydet.inference(image)
+                end = time.time()
+                det_time = (end - start) * 1000
+                print("推理时间为：{:.2f} ms".format(det_time))
+                print("图片完成检测：{}".format(filename))
+
+                # 保存结果图片
+                cv2.imwrite(os.path.join(output_image_folder_path, 'res_' + filename), image)
+
+                # 显示图片
+                cv2.namedWindow("keypoint", cv2.WINDOW_NORMAL)
+                cv2.imshow("keypoint", image)
+
+                # 等待一段时间，这里设置为1毫秒，以便用户可以看到图片
+                cv2.waitKey(1)
+
+        # 处理完所有图片后，再关闭窗口
+        cv2.destroyAllWindows()
+        if keydet.success_crossing:
+            print("成功绕杆")
+        else:
+            print("未成功绕杆")
+    elif mode == 2:
+        # 摄像头人体关键点检测
+        cap = cv2.VideoCapture(0)
+        # 返回当前时间
+        start_time = time.time()
+        counter = 0
+        while True:
+            # 从摄像头中读取一帧图像
+            ret, frame = cap.read()
+            if not ret:
+                break
+            image = keydet.inference(frame)
+            counter += 1  # 计算帧数
+            # 实时显示帧数
+            if (time.time() - start_time) != 0:
+                cv2.putText(image, "FPS:{0}".format(float('%.1f' % (counter / (time.time() - start_time)))), (5, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 1)
+                # 显示图像
+                cv2.imshow('keypoint', image)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        # 释放资源
+        cap.release()
+        cv2.destroyAllWindows()
+    else:
+        print("\033[1;91m 输入错误，请检查mode的赋值 \033[0m")
