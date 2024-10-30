@@ -346,9 +346,9 @@ if __name__ == '__main__':
     mode = 1
     if mode == 1:
         # 输入图片所在文件夹路径
-        input_image_folder_path = r'D:\zwtqq\raogan_other side back'
+        input_image_folder_path = r'D:\zwtqq\kuaisu raogany'
         # 输出图片文件夹路径
-        output_image_folder_path = r'D:\zwtqq\raogan_other side back_tuili'
+        output_image_folder_path = r'D:\zwtqq\kuaisu raogany_tuili'
         # 确保输出文件夹存在
         if not os.path.exists(output_image_folder_path):
             os.makedirs(output_image_folder_path)
