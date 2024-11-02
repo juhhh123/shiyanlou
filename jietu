@@ -175,23 +175,19 @@ class YOLOV5_Seg_onnx():
 
         return masks.gt_(0.5)
 
-    def darw_img(self, masks, det, y2_, isShow=True):
+    def darw_img(self, masks, det, y2_, output_folder, filename, isShow=True):
         masks = masks.cpu().numpy().astype(np.uint8)  # 转为uint8类型
-        mask = np.zeros_like(self.img)  # 创建原图像大小的掩码
-        boxes = []  # 用于保存每个框的坐标
         for i, tar in enumerate(det):
             x1 = int((det[i][0] - self.dw) / self.ratio)
             y1 = int((det[i][1] - self.dh) / self.ratio)
             x2 = int((det[i][2] - self.dw) / self.ratio)
             y2 = int((det[i][3] - self.dh) / self.ratio)
-            boxes.append((x1, y1, x2, y2))  # 保存坐标
-
             print("xyxy: ", x1, y1, x2, y2)
 
             print("cls:", int(tar[5]), "conf:", round(tar[4], 2))
             contours, _ = cv2.findContours(masks[i], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
 
-            #获取分割掩码的坐标
+            # 获取分割掩码的坐标
             x_min = float('inf')
             x_max = float('-inf')
             y_min = float('inf')
@@ -201,29 +197,35 @@ class YOLOV5_Seg_onnx():
                 contour[:, :, 1] = (contour[:, :, 1].astype(np.float32) - self.dh) / self.ratio
 
                 # 只考虑 y 坐标小于 y2 的点
-                valid_points = contour[contour[:, :, 1] < y2_*0.8]
+                valid_points = contour[contour[:, :, 1] < y2_ * 0.8]
 
                 if valid_points.size > 0:  # 检查是否有有效点
                     # 更新 x 和 y 的最大最小值
-                    x_min = min(x_min, np.min(valid_points[:,  0]))
-                    x_max = max(x_max, np.max(valid_points[:,  0]))
-                    y_min = min(y_min, np.min(valid_points[:,  1]))
-
-                new_contours.append(contour)
+                    x_min = min(x_min, np.min(valid_points[:, 0]))
+                    x_max = max(x_max, np.max(valid_points[:, 0]))
+                    y_min = min(y_min, np.min(valid_points[:, 1]))
 
             cv2.rectangle(self.img, (x_min, y_min), (x_max, y2_), self.color[int(tar[5])], 2)  # draw box
-            cv2.fillPoly(mask, new_contours, self.color[int(tar[5])])  # draw mask
-            cv2.putText(self.img, f"cls: {self.classes[int(tar[5])]} conf: {tar[4]:.2f}", (x1, y1 - 10),
+            cv2.putText(self.img, f"cls: {self.classes[int(tar[5])]} conf: {tar[4]:.2f}", (x_min, y_min - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.color[int(tar[5])], 2)  # draw font
-        img = cv2.addWeighted(self.img, 0.7, mask, 0.5, 0)
-        cv2.imwrite("img.jpg", img)
-        cv2.imshow("img", img)
-        cv2.waitKey(0)
+
+            # 裁剪并保存图片
+            crop_img = self.img[y_min:y2_, x_min:x_max]
+            cv2.imwrite(os.path.join(output_folder, filename), crop_img)
 
 
-    def aftertreatment(self, pred, proto, y2,conf_threshold=0.25, iou_threshold=0.5):
+
+    def aftertreatment(self, pred, proto, y2, conf_threshold=0.25, iou_threshold=0.5, output_folder=None,
+                       filename=None):
         """ 后处理 """
         out_put = pred[0]  # (25200, 117)
+
+        # 确保 out_put[:, 4] 是数值类型
+        if out_put[:, 4].dtype == object:
+            out_put[:, 4] = out_put[:, 4].astype(float)
+
+        # 确保 conf_threshold 是数值类型
+        conf_threshold = float(conf_threshold)
 
         # filter conf
         conf = out_put[:, 4] > conf_threshold
@@ -250,38 +252,53 @@ class YOLOV5_Seg_onnx():
                 out_put.append(curr_cls_box[k])
         det = np.array(out_put)
         masks = self.process_mask(proto[0], det[:, 6:], det[:, :4], self.im.shape[:2], upsample=True)  # HWC
-        self.darw_img(masks, det,y2)  # 画图
-
+        self.darw_img(masks, det, y2, output_folder, filename)  # 画图
 
 if __name__ == '__main__':
     # yolov5 onnx
     model_seg = YOLOV5_Seg_onnx("yolov5m-seg.onnx", half=False)
 
-    model_face = insightface.app.FaceAnalysis(name=f'buffalo_l',
-                                 root='./',
-                                 providers=['CUDAExecutionProvider'])
-    model_face.prepare(ctx_id=0, det_thresh=0.4, det_size=(640,640))
-    img_folder = r'C:\Users\IROAD\Desktop\imm\05'
-    for filename in os.listdir(img_folder):
-        img_path = os.path.join(img_folder, filename)
-        img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), -1)
-        bboxes, kpss = model_face.det_model.detect(img)
-        faces = []
-        faces_bbox = []
-        if bboxes.shape[0] > 0:
-            for i in range(bboxes.shape[0]):
-                bbox = bboxes[i, 0:4]
-                det_score = bboxes[i, 4]
-                kps = kpss[i]
-                # 人脸框、关键点以及检测得分
-                face = Face(bbox=bbox, kps=kps, det_score=det_score)
-                faces.append(face)
-                # 人脸框
-                faces_bbox.append(bbox.astype(np.int32).tolist())
-        results, aimgs, np_feature = [], [], []
-        bboxes = []
-        for face in faces:
-            bboxes.append(face.bbox.astype(np.int32).tolist())
-            pred, proto = model_seg.inference(img)
-            # aftertreatment
-            model_seg.aftertreatment(pred, proto,bboxes[-1][-1])
+    model_face = insightface.app.FaceAnalysis(name='buffalo_l',
+                                              root='./',
+                                              providers=['CUDAExecutionProvider'])
+    model_face.prepare(ctx_id=0, det_thresh=0.4, det_size=(640, 640))
+
+    # 输入文件夹和输出文件夹
+    input_folder = r'C:\Users\IROAD\Desktop\imm\01'
+    output_folder = r'C:\Users\IROAD\Desktop\imm\output'
+
+    # 如果输出文件夹不存在，则创建
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # 遍历文件夹及其子目录
+    for root, dirs, files in os.walk(input_folder):
+        for filename in files:
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):  # 只处理图片文件
+                img_path = os.path.join(root, filename)
+                img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), -1)
+                bboxes, kpss = model_face.det_model.detect(img)
+                faces = []
+                faces_bbox = []
+                if bboxes.shape[0] > 0:
+                    for i in range(bboxes.shape[0]):
+                        bbox = bboxes[i, 0:4]
+                        det_score = bboxes[i, 4]
+                        kps = kpss[i]
+                        # 人脸框、关键点以及检测得分
+                        face = Face(bbox=bbox, kps=kps, det_score=det_score)
+                        faces.append(face)
+                        # 人脸框
+                        faces_bbox.append(bbox.astype(np.int32).tolist())
+                results, aimgs, np_feature = [], [], []
+                bboxes = []
+                for face in faces:
+                    bboxes.append(face.bbox.astype(np.int32).tolist())
+                    pred, proto = model_seg.inference(img)
+                    # aftertreatment
+                    model_seg.aftertreatment(pred, proto, bboxes[-1][-1], 0.25, 0.5, output_folder, filename)
+
+
+
+
+
