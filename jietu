@@ -1,0 +1,287 @@
+import insightface
+import onnx
+import onnxruntime as ort
+import torch.nn.functional as F
+import cv2
+import numpy as np
+import time
+import torch
+from yolo_head_detect import *
+from insightface.app.common import Face
+from insightface.utils import face_align
+
+CLASSES = ['person']  # coco80类别
+
+
+class YOLOV5_Seg_onnx():
+    def __init__(self, weights,  half=False):
+        self.half = half
+        self.classes = CLASSES
+        self.color = [(0, 255, 0), (114, 114, 114), (0, 144, 144), (114, 114, 0), (114, 0, 114), (255, 0, 0)]
+
+        onnx_model = onnx.load_model(weights)
+        try:
+            onnx.checker.check_model(onnx_model)
+        except Exception:
+            print("model error!")
+        else:
+            print("model success!")
+
+        options = ort.SessionOptions()
+
+        options.enable_profiling = False
+
+        self.onnx_session = ort.InferenceSession(weights, sess_options=options, providers=[
+            "CUDAExecutionProvider" if torch.cuda.is_available() else "CPUExecutionProvider"])
+        self.input_name = self.get_input_name()
+        self.output_name = self.get_output_name()
+
+        self.warm_up()  # warm up
+
+    def get_input_name(self):
+        input_name = []
+        for node in self.onnx_session.get_inputs():
+            input_name.append(node.name)
+        return input_name
+
+    def get_output_name(self):
+        output_name = []
+        for node in self.onnx_session.get_outputs():
+            output_name.append(node.name)
+        return output_name
+
+    def get_input_feed(self, image_numpy):
+        input_feed = {}
+        for name in self.input_name:
+            input_feed[name] = image_numpy
+        return input_feed
+
+    # warm up
+    def warm_up(self):
+        input_numpy = np.empty((1, 3, 640, 640), dtype=np.float16 if self.half else np.float32)
+        input_feed = self.get_input_feed(input_numpy)
+        pred, proto = self.onnx_session.run(None, input_feed)[:2]
+        print("model warm up success!")
+
+    def letterbox(self, im, new_shape=(640, 640), color=(114, 114, 114)):
+        shape = im.shape[:2]
+
+        self.ratio = min(new_shape[0] / shape[0], new_shape[1] / shape[1])  # Scale ration
+
+        new_unpad = int(round(shape[1] * self.ratio)), int(round(shape[0] * self.ratio))  # w h
+
+        self.dw, self.dh = (new_shape[1] - new_unpad[0]) / 2, (new_shape[0] - new_unpad[1]) / 2  # w, h  padding
+
+        if shape[::-1] != new_unpad:
+            im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(self.dh - 0.1)), int(round(self.dh + 0.1))
+        left, right = int(round(self.dw - 0.1)), int(round(self.dw + 0.1))
+        self.im = cv2.copyMakeBorder(im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return self.im, self.ratio, (self.dw, self.dh)
+
+    def pretreatment(self, img):
+        self.img = img
+        self.or_img, ratio, (dw, dh) = self.letterbox(self.img)
+        img = self.or_img[:, :, ::-1].transpose(2, 0, 1)  # BGR 2 RGB 和 HWC 2 CHW
+        img = img / 255.0  # 归一化
+        img = img[None]  # 增加批次N
+        return img
+
+    def inference(self,img):
+        """ 模型推理 """
+        img = self.pretreatment(img).astype(np.float16 if self.half else np.float32)
+        input_feed = self.get_input_feed(image_numpy=img)
+        start_time = time.time()
+        pred, proto = self.onnx_session.run(None, input_feed=input_feed)[:2]
+        print("模型推理耗时:", round((time.time() - start_time) * 1000, 2), "ms")
+        return pred, proto
+
+    def xywh2xyxy(self, x):
+        """ xywh 2 xyxy """
+        y = np.copy(x)
+        y[:, 0] = x[:, 0] - x[:, 2] / 2
+        y[:, 1] = x[:, 1] - x[:, 3] / 2
+        y[:, 2] = x[:, 0] + x[:, 2] / 2
+        y[:, 3] = x[:, 1] + x[:, 3] / 2
+        return y
+
+    def iou(self, a_box, b_box, isMin=False):
+        if a_box.dtype == "float16" or b_box.dtype == "float32":
+            a_box = a_box.astype(np.float32)
+            b_box = b_box.astype(np.float32)
+
+        a_box_area = (a_box[2] - a_box[0]) * (a_box[3] - a_box[1])
+        b_box_area = (b_box[:, 2] - b_box[:, 0]) * (b_box[:, 3] - b_box[:, 1])
+
+        xx1 = np.maximum(a_box[0], b_box[:, 0])
+        yy1 = np.maximum(a_box[1], b_box[:, 1])
+        xx2 = np.minimum(a_box[2], b_box[:, 2])
+        yy2 = np.minimum(a_box[3], b_box[:, 3])
+
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+
+        inter = w * h
+
+        if isMin:
+            ious = np.true_divide(inter, np.maximum(a_box_area, b_box_area))
+        else:
+            ious = np.true_divide(inter, (a_box_area + b_box_area - inter))
+        return ious
+
+    def nms(self, dets, thresh):
+        if dets.shape[0] == 0:
+            return np.array([])
+        sort_index = dets[:, 4].argsort()[::-1]  # 从大到小排序
+
+        keep = []
+        while sort_index.size > 0:
+            keep.append(sort_index[0])
+
+            box_a = dets[sort_index[0]]  # 第一个置信度最高的框
+            box_b = dets[sort_index[1:]]  # 其余所有框
+            iou = self.iou(box_a, box_b)
+
+            idx = np.where(iou <= thresh)[0]
+            sort_index = sort_index[idx + 1]
+        return keep
+
+    def crop_mask(self, masks, boxes):
+        n, h, w = masks.shape
+        x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4,
+                                     1)
+        r = torch.arange(w, device=torch.from_numpy(masks).device, dtype=x1.dtype)[None, None, :]  # rows shape(1,1,w)
+        c = torch.arange(h, device=torch.from_numpy(masks).device, dtype=x1.dtype)[None, :, None]  # cols shape(1,h,1)
+
+        return torch.from_numpy(masks) * ((r >= x1) * (r < x2) * (c >= y1) * (
+                    c < y2))
+
+    def process_mask(self, protos, masks_in, bboxes, shape, upsample=False):
+        c, mh, mw = protos.shape  # CHW
+        ih, iw = shape
+        masks = (torch.from_numpy(masks_in) @ torch.from_numpy(protos).float().view(c, -1)).sigmoid().view(-1, mh,
+                                                                                                           mw).numpy()
+
+        downsampled_bboxes = torch.from_numpy(bboxes).clone()
+        downsampled_bboxes[:, 0] *= mw / iw
+        downsampled_bboxes[:, 2] *= mw / iw
+        downsampled_bboxes[:, 3] *= mh / ih
+        downsampled_bboxes[:, 1] *= mh / ih
+
+        masks = self.crop_mask(masks, downsampled_bboxes)
+
+        if upsample:
+            masks = F.interpolate(masks[None], (640, 640), mode="bilinear", align_corners=False)[0]
+
+        return masks.gt_(0.5)
+
+    def darw_img(self, masks, det, y2_, isShow=True):
+        masks = masks.cpu().numpy().astype(np.uint8)  # 转为uint8类型
+        mask = np.zeros_like(self.img)  # 创建原图像大小的掩码
+        boxes = []  # 用于保存每个框的坐标
+        for i, tar in enumerate(det):
+            x1 = int((det[i][0] - self.dw) / self.ratio)
+            y1 = int((det[i][1] - self.dh) / self.ratio)
+            x2 = int((det[i][2] - self.dw) / self.ratio)
+            y2 = int((det[i][3] - self.dh) / self.ratio)
+            boxes.append((x1, y1, x2, y2))  # 保存坐标
+
+            print("xyxy: ", x1, y1, x2, y2)
+
+            print("cls:", int(tar[5]), "conf:", round(tar[4], 2))
+            contours, _ = cv2.findContours(masks[i], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+            #获取分割掩码的坐标
+            x_min = float('inf')
+            x_max = float('-inf')
+            y_min = float('inf')
+            new_contours = []
+            for contour in contours:
+                contour[:, :, 0] = (contour[:, :, 0].astype(np.float32) - self.dw) / self.ratio
+                contour[:, :, 1] = (contour[:, :, 1].astype(np.float32) - self.dh) / self.ratio
+
+                # 只考虑 y 坐标小于 y2 的点
+                valid_points = contour[contour[:, :, 1] < y2_*0.8]
+
+                if valid_points.size > 0:  # 检查是否有有效点
+                    # 更新 x 和 y 的最大最小值
+                    x_min = min(x_min, np.min(valid_points[:,  0]))
+                    x_max = max(x_max, np.max(valid_points[:,  0]))
+                    y_min = min(y_min, np.min(valid_points[:,  1]))
+
+                new_contours.append(contour)
+
+            cv2.rectangle(self.img, (x_min, y_min), (x_max, y2_), self.color[int(tar[5])], 2)  # draw box
+            cv2.fillPoly(mask, new_contours, self.color[int(tar[5])])  # draw mask
+            cv2.putText(self.img, f"cls: {self.classes[int(tar[5])]} conf: {tar[4]:.2f}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.color[int(tar[5])], 2)  # draw font
+        img = cv2.addWeighted(self.img, 0.7, mask, 0.5, 0)
+        cv2.imwrite("img.jpg", img)
+        cv2.imshow("img", img)
+        cv2.waitKey(0)
+
+
+    def aftertreatment(self, pred, proto, y2,conf_threshold=0.25, iou_threshold=0.5):
+        """ 后处理 """
+        out_put = pred[0]  # (25200, 117)
+
+        # filter conf
+        conf = out_put[:, 4] > conf_threshold
+        box = out_put[conf == True]  # (52, 117)
+
+        # 使用argmax获取类别
+        cls_cinf = box[..., 5:85]
+        cls = [int(np.argmax(cl)) for cl in cls_cinf]
+        all_cls = list(set(cls))
+        out_put = []
+        for i in range(len(all_cls)):
+            curr_cls = all_cls[i]
+            curr_cls_box = []
+
+            for j in range(len(cls)):
+                if cls[j] == curr_cls:
+                    box[j][5] = curr_cls
+                    curr_cls_box1 = np.append(box[j][:6], box[j][85:])
+                    curr_cls_box.append(curr_cls_box1)
+            curr_cls_box = np.array(curr_cls_box)  # x1 y1 x2 y2 w h score class
+            curr_cls_box = self.xywh2xyxy(curr_cls_box)
+            idx = self.nms(curr_cls_box, iou_threshold)
+            for k in idx:
+                out_put.append(curr_cls_box[k])
+        det = np.array(out_put)
+        masks = self.process_mask(proto[0], det[:, 6:], det[:, :4], self.im.shape[:2], upsample=True)  # HWC
+        self.darw_img(masks, det,y2)  # 画图
+
+
+if __name__ == '__main__':
+    # yolov5 onnx
+    model_seg = YOLOV5_Seg_onnx("yolov5m-seg.onnx", half=False)
+
+    model_face = insightface.app.FaceAnalysis(name=f'buffalo_l',
+                                 root='./',
+                                 providers=['CUDAExecutionProvider'])
+    model_face.prepare(ctx_id=0, det_thresh=0.4, det_size=(640,640))
+    img_folder = r'C:\Users\IROAD\Desktop\imm\05'
+    for filename in os.listdir(img_folder):
+        img_path = os.path.join(img_folder, filename)
+        img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), -1)
+        bboxes, kpss = model_face.det_model.detect(img)
+        faces = []
+        faces_bbox = []
+        if bboxes.shape[0] > 0:
+            for i in range(bboxes.shape[0]):
+                bbox = bboxes[i, 0:4]
+                det_score = bboxes[i, 4]
+                kps = kpss[i]
+                # 人脸框、关键点以及检测得分
+                face = Face(bbox=bbox, kps=kps, det_score=det_score)
+                faces.append(face)
+                # 人脸框
+                faces_bbox.append(bbox.astype(np.int32).tolist())
+        results, aimgs, np_feature = [], [], []
+        bboxes = []
+        for face in faces:
+            bboxes.append(face.bbox.astype(np.int32).tolist())
+            pred, proto = model_seg.inference(img)
+            # aftertreatment
+            model_seg.aftertreatment(pred, proto,bboxes[-1][-1])
