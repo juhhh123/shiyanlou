@@ -1,0 +1,68 @@
+import os
+import cv2
+
+# 指定输入图片文件夹、标注文件文件夹和输出标注图片文件夹
+INPUT_IMAGE_FOLDER = r"D:\20250208_1\images\images_7_tiaosheng"
+YOLO_ANNOTATION_FOLDER = r"D:\20250208_1\labels_2lei"
+OUTPUT_IMAGE_FOLDER = r"D:\20250208_1\shengcheng"
+
+# 如果输出文件夹不存在，则创建它们
+if not os.path.exists(OUTPUT_IMAGE_FOLDER):
+    os.makedirs(OUTPUT_IMAGE_FOLDER)
+
+# 遍历输入图片文件夹中的所有图片文件
+for filename in os.listdir(INPUT_IMAGE_FOLDER):
+    if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+        # 构建图片的完整路径
+        image_path = os.path.join(INPUT_IMAGE_FOLDER, filename)
+        # 加载图片
+        image = cv2.imread(image_path)
+        # 获取图像的宽度和高度
+        height, width, _ = image.shape
+
+        # 构建对应的 YOLO 标注文件路径
+        yolo_filename = os.path.splitext(filename)[0] + '.txt'
+        yolo_file_path = os.path.join(YOLO_ANNOTATION_FOLDER, yolo_filename)
+
+        # 检查标注文件是否存在
+        if os.path.exists(yolo_file_path):
+            # 读取标注文件
+            with open(yolo_file_path, 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    # 解析标注信息
+                    class_id, x_center_norm, y_center_norm, width_norm, height_norm = map(float, line.strip().split())
+                    # 将归一化的坐标转换为像素坐标
+                    x_center = int(x_center_norm * width)
+                    y_center = int(y_center_norm * height)
+                    box_width = int(width_norm * width)
+                    box_height = int(height_norm * height)
+                    # 计算边界框的左上角和右下角坐标
+                    x1 = int(x_center - box_width / 2)
+                    y1 = int(y_center - box_height / 2)
+                    x2 = int(x_center + box_width / 2)
+                    y2 = int(y_center + box_height / 2)
+                    # 绘制边界框
+                    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                    # 根据 class_id 确定要显示的文本
+                    if class_id == 0:
+                        text = "up"
+                    elif class_id == 1:
+                        text = "down"
+                    else:
+                        text = str(int(class_id))
+
+                    # 在框的左上角绘制文本
+                    text_position = (x1, y1 - 10)  # 文本显示在框的左上角上方一点
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.9
+                    color = (0, 255, 0)
+                    thickness = 2
+                    cv2.putText(image, text, text_position, font, font_scale, color, thickness)
+
+        # 构建输出图片的完整路径
+        output_image_path = os.path.join(OUTPUT_IMAGE_FOLDER, filename)
+        # 保存标注后的图片
+        cv2.imwrite(output_image_path, image)
+        print(f"Annotated image saved to {output_image_path}")
