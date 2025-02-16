@@ -186,7 +186,7 @@ def assign_2_5_6_numbers(boxes):
                     assigned_numbers[up_index] = 6
                 else:
                     assigned_numbers[up_index] = 5
-                _, (y1, _, _, _) = down_box
+                _, (_, y1, _, _) = down_box
                 if y1 < 720 // 2:
                     remaining_numbers = [5, 6]
                     if assigned_numbers[up_index] in remaining_numbers:
