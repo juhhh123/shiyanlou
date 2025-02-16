@@ -1,0 +1,306 @@
+import os
+import cv2
+
+# 指定输入图片文件夹、标注文件文件夹和输出标注图片文件夹
+INPUT_IMAGE_FOLDER = r"D:\tiaosheng\images_s"
+YOLO_ANNOTATION_FOLDER = r"D:\tiaosheng\labels_2lei"
+OUTPUT_IMAGE_FOLDER = r"D:\tiaosheng\1"
+
+# 如果输出文件夹不存在，则创建它们
+if not os.path.exists(OUTPUT_IMAGE_FOLDER):
+    os.makedirs(OUTPUT_IMAGE_FOLDER)
+
+# 定义每个部分可分配的序号
+PART_1_NUMBERS = [3, 7]
+PART_2_NUMBERS = [2, 5, 6]
+PART_3_NUMBERS = [1, 4]
+
+# 定义图片分割点
+SPLIT_1 = 1280 // 3
+SPLIT_2 = 2 * (1280 // 3)
+
+
+def get_box_area_in_part(box, part_start, part_end):
+    """计算边界框在指定部分的面积"""
+    x1, y1, x2, y2 = box
+    left = max(x1, part_start)
+    right = min(x2, part_end)
+    if right > left:
+        return (right - left) * (y2 - y1)
+    return 0
+
+
+def assign_number_to_boxes(boxes, part_numbers):
+    """为指定部分的边界框分配序号"""
+    assigned_numbers = []
+    for _ in boxes:
+        if part_numbers:
+            num = part_numbers.pop(0)
+            assigned_numbers.append(num)
+        else:
+            assigned_numbers.append(None)
+    return assigned_numbers
+
+
+def assign_special_numbers(boxes, num1, num2):
+    """为框分配特定的两个序号"""
+    num_boxes = len(boxes)
+    assigned_numbers = [None] * num_boxes
+    if num_boxes == 0:
+        return assigned_numbers
+    elif num_boxes == 1:
+        class_id, (x1, y1, x2, y2) = boxes[0]
+        if class_id == 0:  # up
+            if y2 < 720 // 2:
+                assigned_numbers[0] = num2
+            else:
+                assigned_numbers[0] = num1
+        elif class_id == 1:  # down
+            if y1 > 720 // 2:
+                assigned_numbers[0] = num1
+            else:
+                assigned_numbers[0] = num2
+    elif num_boxes == 2:
+        class_ids = [box[0] for box in boxes]
+        if all([class_id == 0 for class_id in class_ids]):  # 两个框都是 up
+            y2_values = [box[1][3] for box in boxes]
+            if y2_values[0] < 720 // 2:
+                assigned_numbers[0] = num2
+                assigned_numbers[1] = num1
+            else:
+                assigned_numbers[0] = num1
+                assigned_numbers[1] = num2
+        elif all([class_id == 1 for class_id in class_ids]):  # 两个框都是 down
+            y1_values = [box[1][1] for box in boxes]
+            if y1_values[0] > 720 // 2:
+                assigned_numbers[0] = num1
+                assigned_numbers[1] = num2
+            else:
+                assigned_numbers[0] = num2
+                assigned_numbers[1] = num1
+        elif set(class_ids) == {0, 1}:  # 一个框为 up，一个框为 down
+            up_box = next(box for box in boxes if box[0] == 0)
+            down_box = next(box for box in boxes if box[0] == 1)
+            _, (_, _, _, y2) = up_box
+            up_index = boxes.index(up_box)
+            down_index = boxes.index(down_box)
+            if y2 < 720 // 2:
+                assigned_numbers[up_index] = num2
+                assigned_numbers[down_index] = num1
+            else:
+                assigned_numbers[up_index] = num1
+                assigned_numbers[down_index] = num2
+    return assigned_numbers
+
+
+def assign_2_5_6_numbers(boxes):
+    num_boxes = len(boxes)
+    assigned_numbers = [None] * num_boxes
+
+    # 没有框的情况
+    if num_boxes == 0:
+        return assigned_numbers
+
+    # 一个框的情况
+    elif num_boxes == 1:
+        class_id, (x1, y1, x2, y2) = boxes[0]
+        x_mid = (x1 + x2) // 2
+        if class_id == 0:  # up
+            if y2 > 720 // 2:
+                assigned_numbers[0] = 2
+            else:
+                if x_mid < 1280 // 2:
+                    assigned_numbers[0] = 6
+                else:
+                    assigned_numbers[0] = 5
+        elif class_id == 1:  # down
+            if y1 > 720 // 2:
+                assigned_numbers[0] = 2
+            else:
+                if x_mid < 1280 // 2:
+                    assigned_numbers[0] = 6
+                else:
+                    assigned_numbers[0] = 5
+
+    # 两个框的情况
+    elif num_boxes == 2:
+        class_ids = [box[0] for box in boxes]
+        if all([class_id == 0 for class_id in class_ids]):  # 两个框都是 up
+            y2_values = [box[1][3] for box in boxes]
+            if any(y2 > 720 // 2 for y2 in y2_values):
+                index_2 = next(i for i, y2 in enumerate(y2_values) if y2 > 720 // 2)
+                assigned_numbers[index_2] = 2
+                remaining_index = 1 - index_2
+                x1, _, x2, _ = boxes[remaining_index][1]
+                x_mid = (x1 + x2) // 2
+                if x_mid < 1280 // 2:
+                    assigned_numbers[remaining_index] = 6
+                else:
+                    assigned_numbers[remaining_index] = 5
+            else:
+                for i, box in enumerate(boxes):
+                    x1, _, x2, _ = box[1]
+                    x_mid = (x1 + x2) // 2
+                    if x_mid < 1280 // 2:
+                        assigned_numbers[i] = 6
+                    else:
+                        assigned_numbers[i] = 5
+        elif all([class_id == 1 for class_id in class_ids]):  # 两个框都是 down
+            y1_values = [box[1][1] for box in boxes]
+            if any(y1 > 720 // 2 for y1 in y1_values):
+                index_2 = next(i for i, y1 in enumerate(y1_values) if y1 > 720 // 2)
+                assigned_numbers[index_2] = 2
+                remaining_index = 1 - index_2
+                x1, _, x2, _ = boxes[remaining_index][1]
+                x_mid = (x1 + x2) // 2
+                if x_mid < 1280 // 2:
+                    assigned_numbers[remaining_index] = 6
+                else:
+                    assigned_numbers[remaining_index] = 5
+            else:
+                for i, box in enumerate(boxes):
+                    x1, _, x2, _ = box[1]
+                    x_mid = (x1 + x2) // 2
+                    if x_mid < 1280 // 2:
+                        assigned_numbers[i] = 6
+                    else:
+                        assigned_numbers[i] = 5
+        elif set(class_ids) == {0, 1}:  # 一个框为 up，一个框为 down
+            up_box = next(box for box in boxes if box[0] == 0)
+            down_box = next(box for box in boxes if box[0] == 1)
+            up_index = boxes.index(up_box)
+            down_index = boxes.index(down_box)
+            _, (_, _, _, y2) = up_box
+            if y2 > 720 // 2:
+                assigned_numbers[up_index] = 2
+                x1, _, x2, _ = down_box[1]
+                x_mid = (x1 + x2) // 2
+                if x_mid < 1280 // 2:
+                    assigned_numbers[down_index] = 6
+                else:
+                    assigned_numbers[down_index] = 5
+            else:
+                x1, _, x2, _ = up_box[1]
+                x_mid = (x1 + x2) // 2
+                if x_mid < 1280 // 2:
+                    assigned_numbers[up_index] = 6
+                else:
+                    assigned_numbers[up_index] = 5
+                _, (y1, _, _, _) = down_box
+                if y1 < 720 // 2:
+                    remaining_numbers = [5, 6]
+                    if assigned_numbers[up_index] in remaining_numbers:
+                        remaining_numbers.remove(assigned_numbers[up_index])
+                    assigned_numbers[down_index] = remaining_numbers[0]
+                else:
+                    assigned_numbers[down_index] = 2
+
+    return assigned_numbers
+
+
+# 遍历输入图片文件夹中的所有图片文件
+for filename in os.listdir(INPUT_IMAGE_FOLDER):
+    if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+        # 构建图片的完整路径
+        image_path = os.path.join(INPUT_IMAGE_FOLDER, filename)
+        # 加载图片
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Failed to read image: {image_path}")
+            continue
+        # 获取图像的宽度和高度
+        height, width, _ = image.shape
+
+        # 构建对应的 YOLO 标注文件路径
+        yolo_filename = os.path.splitext(filename)[0] + '.txt'
+        yolo_file_path = os.path.join(YOLO_ANNOTATION_FOLDER, yolo_filename)
+
+        part_1_boxes = []
+        part_2_boxes = []
+        part_3_boxes = []
+        boxes_info = []
+
+        # 检查标注文件是否存在
+        if os.path.exists(yolo_file_path):
+            # 读取标注文件
+            with open(yolo_file_path, 'r') as f:
+                lines = f.readlines()
+                for line in lines:
+                    # 解析标注信息
+                    class_id, x_center_norm, y_center_norm, width_norm, height_norm = map(float, line.strip().split())
+                    # 将归一化的坐标转换为像素坐标
+                    x_center = int(x_center_norm * width)
+                    y_center = int(y_center_norm * height)
+                    box_width = int(width_norm * width)
+                    box_height = int(height_norm * height)
+                    # 计算边界框的左上角和右下角坐标
+                    x1 = int(x_center - box_width / 2)
+                    y1 = int(y_center - box_height / 2)
+                    x2 = int(x_center + box_width / 2)
+                    y2 = int(y_center + box_height / 2)
+
+                    # 计算边界框在三个部分的面积
+                    area_part_1 = get_box_area_in_part((x1, y1, x2, y2), 0, SPLIT_1)
+                    area_part_2 = get_box_area_in_part((x1, y1, x2, y2), SPLIT_1, SPLIT_2)
+                    area_part_3 = get_box_area_in_part((x1, y1, x2, y2), SPLIT_2, width)
+
+                    # 根据面积大小将边界框分配到相应的部分
+                    if area_part_1 >= area_part_2 and area_part_1 >= area_part_3:
+                        part_1_boxes.append((class_id, (x1, y1, x2, y2)))
+                    elif area_part_2 >= area_part_1 and area_part_2 >= area_part_3:
+                        part_2_boxes.append((class_id, (x1, y1, x2, y2)))
+                    else:
+                        part_3_boxes.append((class_id, (x1, y1, x2, y2)))
+
+                    # 保存边界框信息
+                    boxes_info.append((class_id, (x1, y1, x2, y2)))
+
+        # 为每个部分的框分配序号
+        part_1_numbers = assign_special_numbers(part_1_boxes, 3, 7)
+        part_2_numbers = assign_2_5_6_numbers(part_2_boxes)
+        part_3_numbers = assign_special_numbers(part_3_boxes, 1, 4)
+
+        # 合并所有框和对应的序号、类别信息
+        all_boxes_info = part_1_boxes + part_2_boxes + part_3_boxes
+        all_numbers = part_1_numbers + part_2_numbers + part_3_numbers
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.9
+        thickness = 2
+
+        # 边界框颜色
+        box_color = (0, 255, 0)
+        # up 和 down 文本颜色（红色）
+        class_text_color = (0, 0, 255)
+        # 序号文本颜色（蓝色）
+        number_text_color = (255, 0, 0)
+
+        # 在图片上绘制边界框、类别文本和序号
+        for (class_id, box), num in zip(all_boxes_info, all_numbers):
+            x1, y1, x2, y2 = box
+            # 绘制边界框（使用第二个代码的画框逻辑）
+            cv2.rectangle(image, (x1, y1), (x2, y2), box_color, 2)
+
+            # 根据 class_id 确定要显示的文本
+            if class_id == 0:
+                text = "up"
+            elif class_id == 1:
+                text = "down"
+            else:
+                text = str(int(class_id))
+
+            # 在框的左上角绘制文本（使用第二个代码的绘制文本逻辑）
+            text_position = (x1, y1 - 10)
+            cv2.putText(image, text, text_position, font, font_scale, class_text_color, thickness)
+
+            # 如果序号存在，在框的右上角绘制序号
+            if num is not None:
+                number_text = str(num)
+                number_position = (x2 - 20, y1 + 20)
+                cv2.putText(image, number_text, number_position, font, font_scale, number_text_color, thickness)
+
+        # 构建输出图片的完整路径
+        output_image_path = os.path.join(OUTPUT_IMAGE_FOLDER, filename)
+        # 保存标注后的图片
+        cv2.imwrite(output_image_path, image)
+        print(f"Annotated image saved to {output_image_path}")
